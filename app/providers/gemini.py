@@ -40,16 +40,29 @@ class GeminiProvider:
         self,
         agent: AgentConfig,
         message: str,
+        *,
+        orchestration_prompt: bool = False,
     ) -> CommandResult:
-        return await asyncio.to_thread(self._run_chat_sync, agent, message)
+        return await asyncio.to_thread(self._run_chat_sync, agent, message, orchestration_prompt)
 
-    def _run_chat_sync(self, agent: AgentConfig, message: str) -> CommandResult:
-        prompt = build_chat_prompt(agent, message)
+    def _run_chat_sync(
+        self,
+        agent: AgentConfig,
+        message: str,
+        orchestration_prompt: bool = False,
+    ) -> CommandResult:
+        """
+        When ``orchestration_prompt`` is True, ``message`` is the full tool-loop prompt and must not
+        be wrapped with ``build_chat_prompt`` (that layer tells the model to refuse tools).
+        """
+        prompt = message if orchestration_prompt else build_chat_prompt(agent, message)
+        mime: str | None = "application/json" if orchestration_prompt else None
+        temp = 0.05 if orchestration_prompt else 0.7
         raw_text, err = self._generate_content(
             prompt,
             self._model_for_agent(agent),
-            response_mime_type=None,
-            temperature=0.7,
+            response_mime_type=mime,
+            temperature=temp,
         )
         if err:
             return CommandResult(1, "", err)

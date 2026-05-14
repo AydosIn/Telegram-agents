@@ -6,6 +6,8 @@ import urllib.request
 from typing import Any
 
 from app.config import AgentConfig, Settings
+from app.models import CommandResult
+from app.prompts import build_chat_prompt
 from app.providers.gemini import GeminiProvider
 
 
@@ -46,6 +48,8 @@ class OpenAIProvider(GeminiProvider):
         *,
         response_mime_type: str | None = "application/json",
         temperature: float = 0.2,
+        system_prompt: str | None = None,
+        max_output_tokens: int | None = None,
     ) -> tuple[str | None, str]:
         url = self._chat_completions_url()
         headers = {
@@ -53,19 +57,22 @@ class OpenAIProvider(GeminiProvider):
             "Content-Type": "application/json",
             "User-Agent": "python-requests/2.31.0",
         }
+        system_default = (
+            "You are a careful coding assistant. Follow the user's requested response format exactly."
+        )
         body: dict[str, Any] = {
             "model": model,
             "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a careful coding assistant. Follow the user's requested response format exactly.",
-                },
+                {"role": "system", "content": system_prompt or system_default},
                 {"role": "user", "content": user_text},
             ],
             "temperature": temperature,
         }
         if response_mime_type == "application/json":
             body["response_format"] = {"type": "json_object"}
+
+        if max_output_tokens is not None and max_output_tokens > 0:
+            body["max_tokens"] = max_output_tokens
 
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(  # noqa: S310 - URL is configured by the application.
@@ -138,3 +145,40 @@ class OpenAIProvider(GeminiProvider):
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
                         texts.append(part["text"])
         return "\n".join(texts) if texts else None
+
+    def _run_chat_sync(
+        self,
+        agent: AgentConfig,
+        message: str,
+        orchestration_prompt: bool = False,
+    ) -> CommandResult:
+        """Stricter JSON system prompt + json_object mode for Groq/OpenAI-style tool loops."""
+        if not orchestration_prompt:
+            prompt = build_chat_prompt(agent, message)
+            max_out = self.settings.ai_max_output_tokens_chat
+            raw_text, err = self._generate_content(
+                prompt,
+                self._model_for_agent(agent),
+                response_mime_type=None,
+                temperature=0.7,
+                max_output_tokens=max_out,
+            )
+        else:
+            max_out = self.settings.ai_max_output_tokens_orchestration
+            raw_text, err = self._generate_content(
+                message,
+                self._model_for_agent(agent),
+                response_mime_type="application/json",
+                temperature=0.05,
+                max_output_tokens=max_out,
+                system_prompt=(
+                    "You are a filesystem tool agent. Reply with exactly one JSON object as specified in the "
+                    "user message: either a tool call ({\"tool\":\"read_file|write_file|edit_file|list_files\", ...}) "
+                    "or {\"reply\":\"...\"} only when the task needs no more tools. "
+                    "No markdown, no commentary outside the JSON."
+                ),
+            )
+        if err:
+            return CommandResult(1, "", err)
+        text = (raw_text or "").strip()
+        return CommandResult(0, text or "I'm here. Say that one more way?", "")

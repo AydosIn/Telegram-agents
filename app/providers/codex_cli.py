@@ -18,8 +18,10 @@ class CodexCLIProvider:
         self,
         agent: AgentConfig,
         message: str,
+        *,
+        orchestration_prompt: bool = False,
     ) -> CommandResult:
-        prompt = build_chat_prompt(agent, message)
+        prompt = message if orchestration_prompt else build_chat_prompt(agent, message)
         log_dir = self.settings.database_path.parent / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         last_message_path = log_dir / f"chat-{agent.name}-last-message.txt"

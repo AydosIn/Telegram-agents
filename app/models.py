@@ -17,6 +17,10 @@ class TaskRecord:
     created_at: str
     updated_at: str
     pushed_at: str | None
+    files_changed: str | None = None
+    completed_at: str | None = None
+    project_key: str | None = None
+    rollback_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,7 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+    attachment_paths: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:

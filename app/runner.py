@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from app.agents.factory import base_agent_for
+from app.commit_ai import suggest_commit_message_ai
 from app.config import AgentConfig, Settings
 from app.formatting import task_title, truncate
 from app.models import CommandResult, TaskRecord
@@ -14,6 +18,9 @@ from app.providers import build_ai_provider_for
 from app.providers.base import AIProvider
 from app.safety import is_unsafe_relative_path
 from app.store import Store
+from app.task_lifecycle import TaskStatus
+from app.tool_chat import ToolChatOrchestrator
+from app.tools.executor import ToolExecutor
 
 
 class AgentRunner:
@@ -21,8 +28,18 @@ class AgentRunner:
         self.settings = settings
         self.store = store
         self._providers: dict[str, AIProvider] = {}
+        self._tool_executor = ToolExecutor(
+            settings.workspace_dir,
+            store=store,
+            settings=settings,
+            commit_suggest_fn=self._suggest_commit,
+        )
 
-    def _normalized_provider_key(self, raw: str) -> str:
+    async def shutdown_browser(self) -> None:
+        await self._tool_executor.shutdown_browser()
+
+    @staticmethod
+    def _normalized_provider_key(raw: str) -> str:
         name = raw.strip().lower()
         if name in ("codex", "codex_cli"):
             return "codex_cli"
@@ -38,6 +55,10 @@ class AgentRunner:
             self._providers[key] = build_ai_provider_for(self.settings, key)
         return self._providers[key]
 
+    async def _suggest_commit(self, agent_name: str, excerpt: str) -> str:
+        agent = self.settings.agents[agent_name]
+        return await suggest_commit_message_ai(self.settings, agent, diff_excerpt=excerpt)
+
     def _qa_review_cwd(self) -> Path | None:
         fe = self.settings.agents["frontend"].repo
         be = self.settings.agents["backend"].repo
@@ -51,6 +72,32 @@ class AgentRunner:
         agent = self.settings.agents[agent_name]
         return await self._provider_for(agent).run_chat(agent, message)
 
+    async def run_chat_with_tools(
+        self,
+        agent_name: str,
+        message: str,
+        *,
+        stream_emit: Callable[[str], Awaitable[None]] | None = None,
+        task_id: int | None = None,
+    ) -> CommandResult:
+        """Group chat turn: filesystem + optional terminal + git tools inside the workspace sandbox."""
+        from app.prompt_context import build_task_continuity_context
+
+        agent = self.settings.agents[agent_name]
+        profile = base_agent_for(agent_name)
+        text = message.strip()
+        if task_id is not None:
+            mem = build_task_continuity_context(self.store, task_id, agent_name)
+            if mem:
+                text = mem + "\n\n## User request\n" + text
+        orchestrator = ToolChatOrchestrator(
+            self.settings,
+            self._tool_executor,
+            max_rounds=self.settings.tool_chat_max_rounds,
+            stream_emit=stream_emit,
+        )
+        return await orchestrator.run(agent, profile, text, task_id=task_id)
+
     async def run_task(self, task: TaskRecord) -> TaskRecord:
         agent = self.settings.agents[task.agent]
         if agent.name == "qa":
@@ -59,24 +106,24 @@ class AgentRunner:
         if agent.repo is None:
             return self.store.update_task(
                 task.id,
-                status="blocked",
+                status=TaskStatus.FAILED,
                 summary=f"{agent.name} does not have a configured repository.",
             )
 
-        self.store.update_task(task.id, status="running")
+        self.store.update_task(task.id, status=TaskStatus.IN_PROGRESS)
 
         dirty = await self.git_status(agent.repo)
         if dirty:
             message = "Repo has uncommitted changes. Clean, commit, or stash them first.\n\n" + dirty
             self.store.add_log(task.id, "warn", message)
-            return self.store.update_task(task.id, status="blocked", summary=message)
+            return self.store.update_task(task.id, status=TaskStatus.FAILED, summary=message)
 
         branch = self.branch_name(agent.name, task.id, task.request)
         checkout = await self.run_command(["git", "checkout", "-b", branch], agent.repo)
         if not checkout.ok:
             return self.store.update_task(
                 task.id,
-                status="failed",
+                status=TaskStatus.FAILED,
                 branch=branch,
                 summary=f"Could not create branch.\n{checkout.combined_output}",
             )
@@ -100,7 +147,7 @@ class AgentRunner:
             self.store.add_log(task.id, "error", ai_result.combined_output)
             return self.store.update_task(
                 task.id,
-                status="failed",
+                status=TaskStatus.FAILED,
                 summary="AI run failed.\n" + truncate(ai_result.combined_output, 1800),
             )
 
@@ -109,14 +156,14 @@ class AgentRunner:
         if unsafe_files:
             return self.store.update_task(
                 task.id,
-                status="failed",
+                status=TaskStatus.FAILED,
                 summary="AI step touched blocked paths. Review manually:\n" + "\n".join(unsafe_files),
             )
 
         if not changed_files:
             return self.store.update_task(
                 task.id,
-                status="done",
+                status=TaskStatus.DONE,
                 summary="AI step completed without file changes.\n\n" + truncate(ai_result.combined_output, 1600),
             )
 
@@ -125,7 +172,7 @@ class AgentRunner:
             changed_list = "\n".join(f"- {path}" for path in changed_files) or "- (none detected)"
             return self.store.update_task(
                 task.id,
-                status="failed",
+                status=TaskStatus.FAILED,
                 verification=truncate(verification.combined_output, 1800),
                 summary=(
                     "Verification failed. Changes are left on the task branch for inspection.\n\n"
@@ -139,7 +186,7 @@ class AgentRunner:
         if unsafe_files:
             return self.store.update_task(
                 task.id,
-                status="failed",
+                status=TaskStatus.FAILED,
                 summary="Verification changed blocked files. Review manually:\n" + "\n".join(unsafe_files),
             )
 
@@ -147,16 +194,22 @@ class AgentRunner:
         if not add.ok:
             return self.store.update_task(
                 task.id,
-                status="failed",
+                status=TaskStatus.FAILED,
                 summary="Could not stage files.\n" + truncate(add.combined_output, 1800),
             )
 
-        commit_message = f"{agent.name}: task {task.id} {task_title(task.request)}"
+        stat = await self.run_command(["git", "diff", "--cached", "--stat"], agent.repo)
+        try:
+            commit_message = await self._suggest_commit(agent.name, stat.combined_output or "")
+        except Exception:
+            commit_message = f"{agent.name}: task {task.id} {task_title(task.request)}"
+        if not commit_message.strip():
+            commit_message = f"{agent.name}: task {task.id} {task_title(task.request)}"
         commit = await self.run_command(["git", "commit", "-m", commit_message], agent.repo)
         if not commit.ok:
             return self.store.update_task(
                 task.id,
-                status="failed",
+                status=TaskStatus.FAILED,
                 summary="Could not commit files.\n" + truncate(commit.combined_output, 1800),
             )
 
@@ -174,14 +227,15 @@ class AgentRunner:
         )
         return self.store.update_task(
             task.id,
-            status="committed",
+            status=TaskStatus.REVIEW,
             commit_hash=commit_hash.stdout.strip() if commit_hash.ok else None,
             summary=summary,
             verification=truncate(verification.combined_output or "Verification passed.", 1200),
+            files_changed=json.dumps(final_changed_files),
         )
 
     async def run_qa_task(self, task: TaskRecord) -> TaskRecord:
-        self.store.update_task(task.id, status="running")
+        self.store.update_task(task.id, status=TaskStatus.IN_PROGRESS)
         results: list[str] = []
         all_ok = True
 
@@ -232,7 +286,7 @@ class AgentRunner:
         final_text = "\n\n".join(results)
         return self.store.update_task(
             task.id,
-            status="done" if all_ok else "failed",
+            status=TaskStatus.DONE if all_ok else TaskStatus.FAILED,
             summary=truncate(final_text, 2400),
             verification=truncate(final_text, 2400),
         )
@@ -240,17 +294,17 @@ class AgentRunner:
     async def push_task(self, task: TaskRecord) -> TaskRecord:
         agent = self.settings.agents[task.agent]
         if agent.repo is None:
-            return self.store.update_task(task.id, status="blocked", summary="This task has no repository.")
+            return self.store.update_task(task.id, status=TaskStatus.FAILED, summary="This task has no repository.")
         if not task.branch:
-            return self.store.update_task(task.id, status="blocked", summary="This task has no branch to push.")
+            return self.store.update_task(task.id, status=TaskStatus.FAILED, summary="This task has no branch to push.")
         if not task.commit_hash:
-            return self.store.update_task(task.id, status="blocked", summary="This task has no commit to push.")
+            return self.store.update_task(task.id, status=TaskStatus.FAILED, summary="This task has no commit to push.")
 
         dirty = await self.git_status(agent.repo)
         if dirty:
             return self.store.update_task(
                 task.id,
-                status="blocked",
+                status=TaskStatus.FAILED,
                 summary="Repo has uncommitted changes. Clean, commit, or stash them before pushing.\n\n" + dirty,
             )
 
@@ -260,7 +314,7 @@ class AgentRunner:
             if not checkout.ok:
                 return self.store.update_task(
                     task.id,
-                    status="failed",
+                    status=TaskStatus.FAILED,
                     summary="Could not check out task branch before push.\n" + checkout.combined_output,
                 )
 
@@ -271,11 +325,11 @@ class AgentRunner:
         if not push.ok:
             return self.store.update_task(
                 task.id,
-                status="failed",
+                status=TaskStatus.FAILED,
                 summary="Push failed.\n" + truncate(push.combined_output, 1800),
             )
 
-        return self.store.update_task(task.id, status="pushed", pushed_at=self.sqlite_now())
+        return self.store.update_task(task.id, status=TaskStatus.DONE, pushed_at=self.sqlite_now())
 
     async def verify(self, agent: AgentConfig, task_id: int) -> CommandResult:
         outputs: list[str] = []

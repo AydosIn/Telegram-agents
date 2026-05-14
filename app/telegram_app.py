@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
 
-from telegram import Update
+from pathlib import Path
+
+from telegram import InputFile, Update
 from telegram.error import TelegramError
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -14,6 +17,7 @@ from app.formatting import format_task, truncate
 from app.models import TaskRecord
 from app.runner import AgentRunner
 from app.store import Store
+from app.task_lifecycle import TaskStatus
 
 
 Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
@@ -28,6 +32,9 @@ class TelegramCoordinator:
             agent_name: asyncio.Lock() for agent_name in settings.agents
         }
 
+    async def shutdown(self) -> None:
+        await self.runner.shutdown_browser()
+
     def build_applications(self) -> list[Application]:
         applications: list[Application] = []
         for agent_name, agent in self.settings.agents.items():
@@ -39,6 +46,8 @@ class TelegramCoordinator:
             app.add_handler(CommandHandler("handoff", self.handoff_command))
             app.add_handler(CommandHandler("status", self.status_command))
             app.add_handler(CommandHandler("push", self.push_command))
+            app.add_handler(CommandHandler("approve_terminal", self.approve_terminal_command))
+            app.add_handler(CommandHandler("approve_git_push", self.approve_git_push_command))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.name_message))
             applications.append(app)
         return applications
@@ -55,6 +64,31 @@ class TelegramCoordinator:
 
         if not request:
             await self.reply(update, f"I'm here. Ask me something like `{target_agent} what do you think?`")
+            return
+
+        use_workflow = (
+            self.settings.workflow_from_mentions
+            and self.settings.file_tools_enabled
+            and target_agent in ("frontend", "backend")
+        )
+        if use_workflow:
+            task = self.store.create_task(
+                target_agent,
+                request,
+                self.sender_name(update),
+                status=TaskStatus.IN_PROGRESS,
+            )
+            await self.reply(update, f"Workflow task opened:\n{format_task(task)}")
+            asyncio.create_task(
+                self.chat_and_report(
+                    context.application,
+                    target_agent,
+                    request,
+                    self.chat_id(update),
+                    update.message.message_id,
+                    workflow_task_id=task.id,
+                ),
+            )
             return
 
         asyncio.create_task(
@@ -98,7 +132,7 @@ class TelegramCoordinator:
             return
 
         task = self.store.create_task(agent_name, request, self.sender_name(update))
-        await self.reply(update, f"Queued {format_task(task)}")
+        await self.reply(update, f"Task created:\n{format_task(task)}")
         asyncio.create_task(self.execute_and_report(context.application, task, self.chat_id(update)))
 
     async def ask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -225,9 +259,25 @@ class TelegramCoordinator:
                     chat_id=chat_id or self.settings.group_chat_id,
                     text=format_task(result),
                 )
+                if (
+                    self.settings.auto_qa_review_task
+                    and result.agent in ("frontend", "backend")
+                    and result.status == TaskStatus.REVIEW
+                ):
+                    qa_task = self.store.create_task(
+                        "qa",
+                        f"Review implementation task #{result.id} ({result.agent}): {result.request}",
+                        created_by=None,
+                    )
+                    await self.safe_send(
+                        app,
+                        f"QA review task #{qa_task.id} queued for implementation #{result.id}.",
+                        chat_id,
+                    )
+                    asyncio.create_task(self.execute_and_report(app, qa_task, chat_id))
             except Exception as exc:
                 logging.exception("Task execution failed")
-                self.store.update_task(task.id, status="failed", summary=str(exc))
+                self.store.update_task(task.id, status=TaskStatus.FAILED, summary=str(exc))
                 await self.safe_send(app, f"Task #{task.id} failed: {exc}", chat_id)
 
     async def push_and_report(self, app: Application, task: TaskRecord, chat_id: int | None) -> None:
@@ -240,8 +290,50 @@ class TelegramCoordinator:
                 )
             except Exception as exc:
                 logging.exception("Push failed")
-                self.store.update_task(task.id, status="failed", summary=str(exc))
+                self.store.update_task(task.id, status=TaskStatus.FAILED, summary=str(exc))
                 await self.safe_send(app, f"Push for task #{task.id} failed: {exc}", chat_id)
+
+    async def approve_terminal_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.is_allowed_chat(update):
+            return
+        if len(context.args) != 1:
+            await self.reply(update, "Usage: `/approve_terminal <pending_id>`")
+            return
+        try:
+            pending_id = int(context.args[0])
+        except ValueError:
+            await self.reply(update, "pending_id must be a number.")
+            return
+
+        if self.store.approve_terminal_pending(pending_id):
+            await self.reply(
+                update,
+                f"Approved terminal command #{pending_id}. The agent can retry the tool with "
+                f'`"approval_id": {pending_id}`.',
+            )
+        else:
+            await self.reply(update, f"No pending terminal request #{pending_id} (already used or unknown).")
+
+    async def approve_git_push_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.is_allowed_chat(update):
+            return
+        if len(context.args) != 1:
+            await self.reply(update, "Usage: `/approve_git_push <pending_id>`")
+            return
+        try:
+            pending_id = int(context.args[0])
+        except ValueError:
+            await self.reply(update, "pending_id must be a number.")
+            return
+
+        if self.store.approve_git_push_pending(pending_id):
+            await self.reply(
+                update,
+                f"Approved git push #{pending_id}. The agent can retry `git_push` with "
+                f'`"approval_id": {pending_id}`.',
+            )
+        else:
+            await self.reply(update, f"No pending git push #{pending_id} (already used or unknown).")
 
     async def chat_and_report(
         self,
@@ -250,15 +342,92 @@ class TelegramCoordinator:
         message: str,
         chat_id: int | None,
         reply_to_message_id: int | None,
+        *,
+        workflow_task_id: int | None = None,
     ) -> None:
         try:
-            result = await self.runner.run_chat(agent_name, message)
+            if self.settings.file_tools_enabled:
+
+                async def stream_emit(chunk: str) -> None:
+                    body = chunk.strip()
+                    if body:
+                        await self.safe_send(
+                            app,
+                            truncate(f"[{agent_name} stream]\n{body}", 3500),
+                            chat_id,
+                            None,
+                        )
+
+                result = await self.runner.run_chat_with_tools(
+                    agent_name,
+                    message,
+                    stream_emit=stream_emit,
+                    task_id=workflow_task_id,
+                )
+            else:
+                result = await self.runner.run_chat(agent_name, message)
             if result.ok:
                 text = truncate(result.combined_output, 3500)
             else:
                 logging.warning("Chat provider failed for %s: %s", agent_name, result.combined_output)
                 text = self.fallback_chat_text(agent_name, result.combined_output)
             await self.safe_send(app, text, chat_id, reply_to_message_id=reply_to_message_id)
+            if result.attachment_paths:
+                await self.send_screenshot_paths(app, result.attachment_paths, chat_id)
+
+            if workflow_task_id is not None:
+                agent_cfg = self.settings.agents[agent_name]
+                if result.ok:
+                    st = TaskStatus.REVIEW
+                    fc: str | None = None
+                    if agent_cfg.repo:
+                        files = await self.runner.changed_files(agent_cfg.repo)
+                        fc = json.dumps(files) if files else None
+                        if not files:
+                            st = TaskStatus.DONE
+                    self.store.update_task(
+                        workflow_task_id,
+                        status=st,
+                        summary=truncate(result.combined_output, 2400),
+                        files_changed=fc,
+                    )
+                    updated = self.store.get_task(workflow_task_id)
+                    await self.safe_send(
+                        app,
+                        truncate(f"[workflow] Task #{workflow_task_id} → {st}\n{format_task(updated)}", 3500),
+                        chat_id,
+                        None,
+                    )
+                    if (
+                        self.settings.auto_qa_review_task
+                        and agent_name in ("frontend", "backend")
+                        and st == TaskStatus.REVIEW
+                    ):
+                        qa_task = self.store.create_task(
+                            "qa",
+                            f"Review mention-workflow task #{workflow_task_id} ({agent_name}): {message[:400]}",
+                            created_by=None,
+                        )
+                        await self.safe_send(
+                            app,
+                            f"QA review #{qa_task.id} queued for workflow #{workflow_task_id}.",
+                            chat_id,
+                            None,
+                        )
+                        asyncio.create_task(self.execute_and_report(app, qa_task, chat_id))
+                else:
+                    self.store.update_task(
+                        workflow_task_id,
+                        status=TaskStatus.FAILED,
+                        summary=truncate(result.combined_output, 2400),
+                    )
+                    failed = self.store.get_task(workflow_task_id)
+                    await self.safe_send(
+                        app,
+                        truncate(f"[workflow] Task #{workflow_task_id} failed.\n{format_task(failed)}", 3500),
+                        chat_id,
+                        None,
+                    )
         except Exception as exc:
             logging.exception("Chat response failed")
             await self.safe_send(app, f"I hit an error while answering: {exc}", chat_id, reply_to_message_id)
@@ -266,6 +435,13 @@ class TelegramCoordinator:
     def fallback_chat_text(self, agent_name: str, provider_output: str) -> str:
         if "429" in provider_output or "quota" in provider_output.lower():
             return "Yes boss, I'm here. My Gemini quota is tapped right now, but the bot wiring is alive."
+        err = (provider_output or "").strip()
+        if err:
+            # Surface runner/API failures instead of a misleading "I'm here" ping.
+            return truncate(
+                f"couldn't finish that run — check logs or retry.\n\n{err}",
+                900,
+            )
         if agent_name == "frontend":
             return "I'm here. Send me the UI thought and I'll keep it sharp."
         if agent_name == "backend":
@@ -289,6 +465,27 @@ class TelegramCoordinator:
             )
         except TelegramError:
             logging.exception("Could not send Telegram message")
+
+    async def send_screenshot_paths(
+        self,
+        app: Application,
+        paths: tuple[str, ...],
+        chat_id: int | None,
+    ) -> None:
+        cid = chat_id or self.settings.group_chat_id
+        for raw in paths:
+            path = Path(raw)
+            if not path.is_file():
+                continue
+            try:
+                with path.open("rb") as fh:
+                    await app.bot.send_photo(
+                        chat_id=cid,
+                        photo=InputFile(fh, filename=path.name),
+                        caption=truncate(path.name, 900),
+                    )
+            except TelegramError:
+                logging.exception("Could not send screenshot %s", path)
 
     async def reply(self, update: Update, text: str) -> None:
         if update.message:
@@ -390,6 +587,10 @@ async def run() -> None:
         )
         await asyncio.Event().wait()
     finally:
+        try:
+            await coordinator.shutdown()
+        except Exception:
+            logging.exception("Playwright/browser shutdown")
         for app in reversed(polling):
             if app.updater is not None:
                 await app.updater.stop()

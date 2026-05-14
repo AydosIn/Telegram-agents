@@ -24,10 +24,16 @@ def format_task(task: TaskRecord) -> str:
     ]
     if task.branch:
         parts.append(f"Branch: {task.branch}")
+    if task.project_key:
+        parts.append(f"Project: {task.project_key}")
     if task.commit_hash:
         parts.append(f"Commit: {task.commit_hash}")
     if task.pushed_at:
         parts.append(f"Pushed: {task.pushed_at}")
+    if task.completed_at:
+        parts.append(f"Completed: {task.completed_at}")
+    if task.files_changed:
+        parts.append(f"Files changed: {truncate(task.files_changed, 500)}")
     if task.summary:
         parts.append(f"Summary: {truncate(task.summary, 900)}")
     if task.verification:

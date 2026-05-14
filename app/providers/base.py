@@ -12,8 +12,10 @@ class AIProvider(Protocol):
         self,
         agent: AgentConfig,
         message: str,
+        *,
+        orchestration_prompt: bool = False,
     ) -> CommandResult:
-        """Return a short plain-text conversational response. Must not modify repositories."""
+        """Telegram small-talk or full tool-orchestration blob when orchestration_prompt is True."""
 
     async def run_agent_work(
         self,

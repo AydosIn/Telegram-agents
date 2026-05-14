@@ -4,6 +4,33 @@ from app.formatting import truncate
 from app.store import Store
 
 
+def build_task_continuity_context(store: Store, task_id: int, agent_name: str) -> str | None:
+    """Prompt-sized snapshot of the active task for multi-turn tool workflows."""
+    try:
+        task = store.get_task(task_id)
+    except KeyError:
+        return None
+
+    lines = [
+        f"## Active task #{task.id} [{task.status}]",
+        f"Owning agent: {task.agent} (you are acting as `{agent_name}`)",
+        f"Project key: {task.project_key or task.agent}",
+        f"Request: {truncate(task.request, 400)}",
+        f"Branch: {task.branch or '(none)'}",
+        f"Rollback ref: {task.rollback_ref or '(none)'}",
+        f"Commit: {task.commit_hash or '(none)'}",
+    ]
+    if task.summary:
+        lines.append(f"Summary: {truncate(task.summary, 500)}")
+    if task.files_changed:
+        lines.append(f"Files changed (JSON): {truncate(task.files_changed, 400)}")
+    logs = store.recent_logs(task_id, limit=6)
+    if logs:
+        lines.append("Recent task logs:")
+        lines.extend(f"  {ln}" for ln in logs)
+    return "\n".join(lines)
+
+
 def build_recent_context_for_agent(
     store: Store,
     *,
