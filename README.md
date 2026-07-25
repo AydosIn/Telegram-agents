@@ -1,4 +1,27 @@
-# Telegram AI development agents
+# Telegram AI Development Agents
+
+## What is it?
+
+A multi-agent system that runs three AI-powered Telegram bots (Frontend, Backend, and QA) to automate software development tasks for the Events Community project. Each bot can receive coding tasks via Telegram, execute them using an AI provider (Codex CLI or Gemini API), verify the output, and commit changes to the appropriate repository.
+
+## Why does this exist?
+
+Managing a full-stack project across frontend and backend repositories requires constant context switching and manual coordination. This system automates the development workflow by letting you assign tasks to specialized bots in a single Telegram group — they handle the code generation, verification, and git operations while you focus on architecture and decision-making.
+
+## When to use it?
+
+- When you want to delegate small-to-medium development tasks (bug fixes, feature additions, refactoring) without opening an IDE
+- When coordinating work across frontend and backend repos simultaneously
+- When you want AI-assisted development with built-in safety rails (branch isolation, verification gates, manual push approval)
+
+## How it can help?
+
+- **Saves time:** Assign tasks via Telegram messages and let the bots write, verify, and commit code
+- **Reduces errors:** Every change goes through automated verification before committing
+- **Safe workflow:** Changes stay on isolated task branches and only push to the remote when you explicitly approve with `/push`
+- **Multi-repo coordination:** Frontend and backend bots can hand off context to each other with `/handoff`
+
+---
 
 Runs three Telegram bots for the Events Community project:
 
